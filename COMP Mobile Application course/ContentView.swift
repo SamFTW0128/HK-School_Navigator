@@ -2,8 +2,9 @@ import SwiftUI
 import MapKit
 import Combine
 import CoreLocation
+import AVFoundation
 
-// 1. Transport Types Enum
+// MARK: - 1. Transport Types Enum
 enum TransportMode: String, CaseIterable {
     case drive = "car.fill"
     case transit = "bus.fill"
@@ -26,9 +27,32 @@ enum TransportMode: String, CaseIterable {
     }
 }
 
-// 2. Data Model
+// MARK: - 2. Map Style Mode
+enum MapDisplayMode: String, CaseIterable {
+    case standard
+    case hybrid
+    case imagery
+    
+    func label(isChinese: Bool) -> String {
+        switch self {
+        case .standard: return isChinese ? "標準" : "Standard"
+        case .hybrid: return isChinese ? "混合" : "Hybrid"
+        case .imagery: return isChinese ? "衛星" : "Satellite"
+        }
+    }
+    
+    var icon: String {
+        switch self {
+        case .standard: return "map"
+        case .hybrid: return "square.3.layers.3d"
+        case .imagery: return "globe.americas.fill"
+        }
+    }
+}
+
+// MARK: - 3. Data Model
 struct School: Identifiable, Hashable {
-    let id = UUID() // The secret to forcing the map to redraw instantly!
+    let id = UUID()
     let nameEN: String
     let nameCH: String
     let coordinate: CLLocationCoordinate2D
@@ -48,51 +72,83 @@ struct School: Identifiable, Hashable {
         let a = isChinese ? addressCH : addressEN
         return a.isEmpty ? addressEN : a
     }
-
+    
     static func == (lhs: School, rhs: School) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    
+    var searchableText: String {
+        [
+            nameEN,
+            nameCH,
+            addressEN,
+            addressCH,
+            districtEN,
+            levelEN,
+            levelCH,
+            financeTypeEN
+        ]
+        .joined(separator: " ")
+    }
     
     var mapIcon: String {
         let l = levelEN.lowercased()
         if l.contains("kindergarten") { return "teddybear.fill" }
         if l.contains("primary") { return "book.fill" }
-        if l.contains("secondary") { return "books.vertical.fill" }
         if l.contains("post-secondary") { return "building.columns.fill" }
+        if l.contains("secondary") { return "books.vertical.fill" }
         return "graduationcap.fill"
     }
 }
 
-// 3. ViewModel
+// MARK: - 4. ViewModel
 class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
     @Published var position: MapCameraPosition = .automatic
     @Published var schools: [School] = []
     
     @Published var selectedSchool: School? {
-        didSet { if selectedSchool != nil { calculateAutoRoute(); fetchNearbyTransit() } }
+        didSet {
+            if selectedSchool != nil {
+                calculateAutoRoute()
+                fetchNearbyTransit()
+            }
+        }
     }
     
     @AppStorage("isChinese") var isChinese: Bool = false {
-        didSet { if selectedSchool != nil { fetchNearbyTransit(); calculateAutoRoute() } }
+        didSet {
+            if selectedSchool != nil {
+                fetchNearbyTransit()
+                calculateAutoRoute()
+            }
+        }
     }
+    
     @AppStorage("savedHomeAddress") var savedHomeAddress: String = ""
+    @AppStorage("favoriteSchoolKeys") private var favoriteSchoolKeysStorage: String = ""
     
     @Published var searchText: String = ""
     @Published var selectedDistrict: String = "All"
     @Published var selectedLevel: String = "All"
-    
     @Published var startPoint: CLLocationCoordinate2D?
     @Published var showSettings = false
-    
-    @Published var transportMode: TransportMode = .drive {
-        didSet { if selectedSchool != nil { calculateAutoRoute() } }
-    }
     @Published var route: MKRoute?
     @Published var travelTime: String = ""
     @Published var travelDistance: String = ""
     @Published var isCalculating = false
     @Published var nearbyMTR: String = ""
+    @Published var currentUserLocation: CLLocationCoordinate2D?
+    @Published var transportMode: TransportMode = .drive {
+        didSet {
+            if selectedSchool != nil {
+                calculateAutoRoute()
+            }
+        }
+    }
+    @Published var mapDisplayMode: MapDisplayMode = .standard
+    @Published var favoriteSchoolKeys: Set<String> = []
     
     private let locationManager = CLLocationManager()
+    private let speechSynthesizer = AVSpeechSynthesizer()
     
     let availableLevels = ["All", "Kindergarten", "Primary", "Secondary", "Post-Secondary"]
     
@@ -126,6 +182,27 @@ class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         "元朗區": "YUEN LONG", "元朗": "YUEN LONG"
     ]
     
+    override init() {
+        super.init()
+        favoriteSchoolKeys = Set(
+            favoriteSchoolKeysStorage
+                .split(separator: "|")
+                .map { String($0) }
+        )
+        
+        locationManager.delegate = self
+        locationManager.desiredAccuracy = kCLLocationAccuracyBest
+        locationManager.requestWhenInUseAuthorization()
+        
+        fetchSchoolData()
+        fetchHigherEducationData()
+        
+        if !savedHomeAddress.isEmpty {
+            geocodeHomeAddress()
+        }
+    }
+    
+    // MARK: Translations
     func translateDistrict(_ dist: String) -> String {
         if dist == "All" { return isChinese ? "全部" : "All" }
         return isChinese ? (districtTranslations[dist.uppercased()] ?? dist) : dist
@@ -154,25 +231,114 @@ class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         return type.capitalized
     }
     
-    override init() {
-        super.init()
-        locationManager.delegate = self
-        locationManager.requestWhenInUseAuthorization()
-        
-        // Only load the data from the network exactly ONCE at startup
-        fetchSchoolData()
-        fetchHigherEducationData()
-        if !savedHomeAddress.isEmpty { geocodeHomeAddress() }
+    // MARK: Favorites
+    private func schoolKey(_ school: School) -> String {
+        "\(school.nameEN)|\(school.addressEN)"
     }
     
-    // THE MASTER FIX: Bypasses the Apple Maps rendering bug without hitting the network
+    func isFavorite(_ school: School) -> Bool {
+        favoriteSchoolKeys.contains(schoolKey(school))
+    }
+    
+    func toggleFavorite(_ school: School) {
+        let key = schoolKey(school)
+        if favoriteSchoolKeys.contains(key) {
+            favoriteSchoolKeys.remove(key)
+        } else {
+            favoriteSchoolKeys.insert(key)
+        }
+        favoriteSchoolKeysStorage = favoriteSchoolKeys.joined(separator: "|")
+    }
+    
+    var favoriteSchools: [School] {
+        schools.filter { favoriteSchoolKeys.contains(schoolKey($0)) }
+    }
+    
+    // MARK: Smart Match Score
+    func smartMatchScore(for school: School) -> Int {
+        // 🛠️ REFINED: Base score is lower so distance makes a bigger impact
+        var score = 40
+        
+        // 1. Filter Matches (Up to +30)
+        if selectedDistrict != "All" && school.districtEN.uppercased() == selectedDistrict.uppercased() {
+            score += 15
+        }
+        
+        if selectedLevel != "All" && school.levelEN.uppercased() == selectedLevel.uppercased() {
+            score += 15
+        }
+        
+        if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           matchesSearch(school, query: searchText) {
+            score += 10
+        }
+        
+        // 2. Distance Match (Massive impact on score based on physical distance)
+        if let baseCoord = currentUserLocation ?? startPoint {
+            let baseLocation = CLLocation(latitude: baseCoord.latitude, longitude: baseCoord.longitude)
+            let schoolLocation = CLLocation(latitude: school.coordinate.latitude, longitude: school.coordinate.longitude)
+            
+            let distanceInKm = baseLocation.distance(from: schoolLocation) / 1000.0
+            
+            if distanceInKm <= 3.0 {
+                score += 30 // Very close!
+            } else if distanceInKm <= 8.0 {
+                score += 15 // Reasonable distance
+            } else if distanceInKm <= 15.0 {
+                score -= 5  // Getting far
+            } else if distanceInKm <= 25.0 {
+                score -= 15 // Quite far
+            } else {
+                score -= 30 // Extremely far
+            }
+        }
+        
+        return min(max(score, 0), 100)
+    }
+    
+    // MARK: Speech / Multimedia
+    func speakSchoolInfo(_ school: School) {
+        speechSynthesizer.stopSpeaking(at: .immediate)
+        
+        let text: String
+        if isChinese {
+            text = """
+            學校名稱：\(school.name(isChinese: true))。
+            地址：\(school.address(isChinese: true))。
+            學校類別：\(translateLevel(school.levelEN))。
+            附近地鐵站：\(nearbyMTR)。
+            預計時間：\(travelTime)。
+            距離：\(travelDistance)。
+            """
+        } else {
+            text = """
+            School name: \(school.name(isChinese: false)).
+            Address: \(school.address(isChinese: false)).
+            School level: \(translateLevel(school.levelEN)).
+            Nearest MTR: \(nearbyMTR).
+            Estimated travel time: \(travelTime).
+            Distance: \(travelDistance).
+            """
+        }
+        
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.rate = 0.48
+        utterance.voice = AVSpeechSynthesisVoice(language: isChinese ? "zh-HK" : "en-GB")
+        speechSynthesizer.speak(utterance)
+    }
+    
+    // MARK: Refresh / Geocode / Search
     func forceMapRefresh() {
         let refreshedSchools = schools.map { oldSchool in
             School(
-                nameEN: oldSchool.nameEN, nameCH: oldSchool.nameCH,
-                coordinate: oldSchool.coordinate, districtEN: oldSchool.districtEN,
-                addressEN: oldSchool.addressEN, addressCH: oldSchool.addressCH,
-                levelEN: oldSchool.levelEN, levelCH: oldSchool.levelCH,
+                nameEN: oldSchool.nameEN,
+                nameCH: oldSchool.nameCH,
+                coordinate: oldSchool.coordinate,
+                districtEN: oldSchool.districtEN,
+                addressEN: oldSchool.addressEN,
+                addressCH: oldSchool.addressCH,
+                levelEN: oldSchool.levelEN,
+                levelCH: oldSchool.levelCH,
                 financeTypeEN: oldSchool.financeTypeEN
             )
         }
@@ -186,26 +352,46 @@ class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             if let coordinate = response?.mapItems.first?.location.coordinate {
                 DispatchQueue.main.async {
                     self.startPoint = coordinate
-                    if self.selectedSchool != nil { self.calculateAutoRoute() }
+                    if self.selectedSchool != nil {
+                        self.calculateAutoRoute()
+                    }
                 }
             }
         }
     }
-
+    
     func fetchNearbyTransit() {
         guard let school = selectedSchool else { return }
         let request = MKLocalSearch.Request()
-        request.region = MKCoordinateRegion(center: school.coordinate, latitudinalMeters: 600, longitudinalMeters: 600)
+        request.region = MKCoordinateRegion(
+            center: school.coordinate,
+            latitudinalMeters: 600,
+            longitudinalMeters: 600
+        )
         
         request.naturalLanguageQuery = isChinese ? "地鐵站" : "MTR Station"
         MKLocalSearch(request: request).start { response, _ in
-            DispatchQueue.main.async { self.nearbyMTR = response?.mapItems.first?.name ?? (self.isChinese ? "無" : "None") }
+            DispatchQueue.main.async {
+                self.nearbyMTR = response?.mapItems.first?.name ?? (self.isChinese ? "無" : "None")
+            }
         }
     }
     
     func calculateAutoRoute() {
         guard let start = startPoint, let end = selectedSchool else { return }
+        
+        if transportMode == .transit {
+            DispatchQueue.main.async {
+                self.isCalculating = false
+                self.route = nil
+                self.travelTime = self.isChinese ? "查看 Apple Maps" : "Check Maps"
+                self.travelDistance = "--"
+            }
+            return
+        }
+        
         isCalculating = true
+        
         let request = MKDirections.Request()
         
         let startLoc = CLLocation(latitude: start.latitude, longitude: start.longitude)
@@ -221,42 +407,112 @@ class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
                 self.isCalculating = false
                 if let route = response?.routes.first {
                     self.route = route
-                    var finalTime = route.expectedTravelTime
-                    
-                    if self.transportMode == .transit { finalTime += 900 }
-                    else if self.transportMode == .walk { finalTime *= 4 }
+                    let finalTime = route.expectedTravelTime
                     
                     self.travelTime = "\(Int(finalTime / 60)) \(self.isChinese ? "分鐘" : "mins")"
                     self.travelDistance = String(format: "%.1f km", route.distance / 1000)
+                } else {
+                    self.route = nil
+                    self.travelTime = "--"
+                    self.travelDistance = "--"
                 }
             }
         }
     }
     
     var filteredSchools: [School] {
-        var result = schools
-        if selectedDistrict != "All" { result = result.filter { $0.districtEN.uppercased() == selectedDistrict.uppercased() } }
-        if selectedLevel != "All" { result = result.filter { $0.levelEN.localizedCaseInsensitiveContains(selectedLevel) } }
-        if !searchText.isEmpty {
-            result = result.filter { $0.nameEN.localizedCaseInsensitiveContains(searchText) || $0.nameCH.localizedCaseInsensitiveContains(searchText) }
+        let cleanSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        if selectedDistrict == "All" && selectedLevel == "All" && cleanSearch.isEmpty {
+            if let selected = selectedSchool {
+                return [selected]
+            }
+            return []
         }
-        return (selectedDistrict == "All" && selectedLevel == "All" && searchText.isEmpty) ? Array(result.prefix(150)) : result
+        
+        var result = schools
+        
+        if selectedDistrict != "All" {
+            result = result.filter { $0.districtEN.uppercased() == selectedDistrict.uppercased() }
+        }
+        
+        if selectedLevel != "All" {
+            result = result.filter { $0.levelEN.uppercased() == selectedLevel.uppercased() }
+        }
+        
+        if !cleanSearch.isEmpty {
+            result = result.filter { matchesSearch($0, query: cleanSearch) }
+        }
+        
+        return result
     }
     
     var availableDistricts: [String] {
-        let districts = Set(schools.map { $0.districtEN.uppercased() }).filter { !$0.isEmpty }
+        let districts = Set(schools.map { $0.districtEN.uppercased() })
+            .filter { !$0.isEmpty && $0 != "VARIOUS" } // 🛠️ FIXED: Filters out "VARIOUS"
         return ["All"] + Array(districts).sorted()
     }
     
+    private func normalizeForSearch(_ text: String) -> String {
+        text
+            .folding(options: [.diacriticInsensitive, .widthInsensitive, .caseInsensitive], locale: .current)
+            .replacingOccurrences(of: "　", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .replacingOccurrences(of: " ", with: "")
+            .lowercased()
+    }
+    
+    private func matchesSearch(_ school: School, query: String) -> Bool {
+        let normalizedQuery = normalizeForSearch(query)
+        let normalizedSchoolText = normalizeForSearch(school.searchableText)
+        
+        if normalizedSchoolText.contains(normalizedQuery) {
+            return true
+        }
+        
+        let simplifiedQuery = query.applyingTransform(.toLatin, reverse: false) ?? query
+        let normalizedSimplifiedQuery = normalizeForSearch(simplifiedQuery)
+        
+        return normalizedSchoolText.contains(normalizedSimplifiedQuery)
+    }
+    
+    // MARK: Location
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            manager.startUpdatingLocation()
+            manager.requestLocation()
+        case .denied, .restricted:
+            print("❌ Location permission denied")
+        case .notDetermined:
+            print("⌛ Location permission not determined")
+        @unknown default:
+            break
+        }
+    }
+    
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        guard let location = locations.last else { return }
+        print("✅ 获取到位置：\(location.coordinate.latitude), \(location.coordinate.longitude)")
+        
+        DispatchQueue.main.async {
+            self.currentUserLocation = location.coordinate
+        }
+    }
+    
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        print("❌ Location update failed: \(error.localizedDescription)")
+    }
+    
+    // MARK: Data Parsing
     private func parseCoord(_ value: Any?) -> Double {
         if let d = value as? Double { return d }
         if let s = value as? String { return Double(s) ?? 0 }
         return 0
     }
     
-    // -----------------------------------------------------------------
-    // API 1: Fetch K-12 Data (Strictly the stable /en/ URL)
-    // -----------------------------------------------------------------
+    // MARK: API 1 - Fetch K-12 Data
     func fetchSchoolData() {
         guard let url = URL(string: "https://www.edb.gov.hk/attachment/en/student-parents/sch-info/sch-search/sch-location-info/SCH_LOC_EDB.json") else { return }
         
@@ -269,20 +525,24 @@ class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
                     let lon = self.parseCoord(item["LONGITUDE"] ?? item["經度"])
                     guard lat != 0 else { return nil }
                     
-                    // THE FIX: Aggressively search for the Chinese name across multiple possible EDB keys
                     let nameEN = (item["ENGLISH NAME"] as? String) ?? (item["英文名稱"] as? String) ?? (item["NAME_ENG"] as? String) ?? ""
                     let nameCH = (item["CHINESE NAME"] as? String) ?? (item["中文名稱"] as? String) ?? (item["NAME_CHI"] as? String) ?? ""
                     let addrEN = (item["ENGLISH ADDRESS"] as? String) ?? (item["英文地址"] as? String) ?? ""
                     let addrCH = (item["CHINESE ADDRESS"] as? String) ?? (item["中文地址"] as? String) ?? ""
                     
-                    let rawDist = ((item["DISTRICT"] as? String) ?? (item["分區"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let rawDist = ((item["DISTRICT"] as? String) ?? (item["分區"] as? String) ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
                     let safeDistEN = self.reverseDistrictTranslations[rawDist] ?? rawDist
                     
                     let rawLvl = (item["SCHOOL LEVEL"] as? String) ?? (item["學校類別"] as? String) ?? ""
                     var safeLvlEN = rawLvl
-                    if rawLvl.contains("幼稚園") { safeLvlEN = "KINDERGARTEN" }
-                    else if rawLvl.contains("小學") { safeLvlEN = "PRIMARY" }
-                    else if rawLvl.contains("中學") { safeLvlEN = "SECONDARY" }
+                    if rawLvl.contains("幼稚園") {
+                        safeLvlEN = "KINDERGARTEN"
+                    } else if rawLvl.contains("小學") {
+                        safeLvlEN = "PRIMARY"
+                    } else if rawLvl.contains("中學") {
+                        safeLvlEN = "SECONDARY"
+                    }
                     
                     return School(
                         nameEN: nameEN.isEmpty ? nameCH : nameEN,
@@ -296,6 +556,7 @@ class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
                         financeTypeEN: (item["FINANCE TYPE"] as? String) ?? (item["資助種類"] as? String) ?? ""
                     )
                 }
+                
                 DispatchQueue.main.async {
                     self.schools.append(contentsOf: mappedK12)
                 }
@@ -303,11 +564,9 @@ class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
         }.resume()
     }
     
-    // -----------------------------------------------------------------
-    // API 2: Fetch Post-Secondary Data
-    // -----------------------------------------------------------------
+    // MARK: API 2 - Fetch Post-Secondary Data
     func fetchHigherEducationData() {
-        guard let url = URL(string: "https://api.csdi.gov.hk/apim/datahub/v1/records?datasetId=edb_rcd_1629267205213_58940") else { return }
+        guard let url = URL(string: "https://portal.csdi.gov.hk/server/services/common/edb_rcd_1629267205213_58940/MapServer/WFSServer?service=wfs&request=GetFeature&typenames=ASFPS&outputFormat=geojson&startIndex=0") else { return }
         
         var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -325,67 +584,173 @@ class MapViewModel: NSObject, ObservableObject, CLLocationManagerDelegate {
             
             var apiSuccess = false
             
-            if let data = data, error == nil, let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+            if let data = data,
+               error == nil,
+               let httpResponse = response as? HTTPURLResponse,
+               httpResponse.statusCode == 200 {
                 do {
                     let decoded = try JSONSerialization.jsonObject(with: data)
                     var itemsToParse: [[String: Any]] = []
                     
-                    if let jsonDict = decoded as? [String: Any] {
-                        itemsToParse = (jsonDict["records"] as? [[String: Any]]) ?? (jsonDict["features"] as? [[String: Any]]) ?? []
-                    } else if let jsonArray = decoded as? [[String: Any]] {
-                        itemsToParse = jsonArray
+                    if let jsonDict = decoded as? [String: Any],
+                       let features = jsonDict["features"] as? [[String: Any]] {
+                        itemsToParse = features
                     }
                     
                     if !itemsToParse.isEmpty {
                         apiSuccess = true
                         let mapped = itemsToParse.compactMap { item -> School? in
-                            let props = (item["properties"] as? [String: Any]) ?? item
+                            let props = (item["properties"] as? [String: Any]) ?? [:]
                             
-                            var lat: Double = 0; var lon: Double = 0
+                            var lat: Double = 0
+                            var lon: Double = 0
                             
-                            if let geom = item["geometry"] as? [String: Any], let coords = geom["coordinates"] as? [Double], coords.count >= 2 {
-                                lat = coords[1]; lon = coords[0]
+                            if let geom = item["geometry"] as? [String: Any],
+                               let coords = geom["coordinates"] as? [Double],
+                               coords.count >= 2 {
+                                lat = coords[1]
+                                lon = coords[0]
                             } else {
-                                lat = self.parseCoord(props["LATITUDE"])
-                                lon = self.parseCoord(props["LONGITUDE"])
+                                lat = self.parseCoord(props["Latitude___緯度"])
+                                lon = self.parseCoord(props["Longitude___經度"])
                             }
                             
                             guard lat != 0 else { return nil }
-                            let nameEN = (props["ENGLISH NAME"] as? String) ?? (props["School_Name_Eng"] as? String) ?? ""
-                            let nameCH = (props["CHINESE NAME"] as? String) ?? (props["School_Name_Chi"] as? String) ?? ""
+                            
+                            let nameEN = (props["Facility_Name"] as? String) ?? "Institution"
+                            let nameCH = (props["設施名稱"] as? String) ?? nameEN
                             
                             return School(
                                 nameEN: nameEN.isEmpty ? "Institution" : nameEN,
                                 nameCH: nameCH.isEmpty ? nameEN : nameCH,
                                 coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-                                districtEN: ((props["DISTRICT"] as? String) ?? "Various").trimmingCharacters(in: .whitespacesAndNewlines),
-                                addressEN: (props["ENGLISH ADDRESS"] as? String) ?? "Contact Institution",
-                                addressCH: (props["CHINESE ADDRESS"] as? String) ?? "請聯絡院校",
-                                levelEN: "Post-Secondary", levelCH: "專上", financeTypeEN: "Higher Education"
+                                districtEN: "Various",
+                                addressEN: (props["Address"] as? String) ?? "Contact Institution",
+                                addressCH: (props["地址"] as? String) ?? "請聯絡院校",
+                                levelEN: "Post-Secondary",
+                                levelCH: "專上",
+                                financeTypeEN: "Higher Education"
                             )
                         }
-                        DispatchQueue.main.async { self.schools.append(contentsOf: mapped) }
+                        
+                        DispatchQueue.main.async {
+                            self.schools.append(contentsOf: mapped)
+                        }
                     }
-                } catch { print("JSON decode failed.") }
+                } catch {
+                    print("JSON decode failed.")
+                }
             }
             
             if !apiSuccess {
-                DispatchQueue.main.async { self.schools.append(contentsOf: fallbackUniversities) }
+                DispatchQueue.main.async {
+                    self.schools.append(contentsOf: fallbackUniversities)
+                }
             }
         }.resume()
     }
 }
 
-// 4. UI Components
+// MARK: - 5. UI Components
 struct FilterChip: View {
     let title: String
     let isSelected: Bool
     let action: () -> Void
+    
     var body: some View {
-        Button(action: action) {
-            Text(title).font(.system(size: 13, weight: .bold)).padding(.horizontal, 14).padding(.vertical, 8)
-                .background(isSelected ? Color.blue : Color(.systemBackground)).foregroundColor(isSelected ? .white : .primary)
-                .cornerRadius(10).shadow(radius: 1)
+        Button(action: {
+            withAnimation(.spring(response: 0.25, dampingFraction: 0.75)) {
+                action()
+            }
+        }) {
+            Text(title)
+                .font(.system(size: 13, weight: .bold))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(
+                    LinearGradient(
+                        colors: isSelected ? [Color.blue, Color.cyan] : [Color(.systemBackground)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .foregroundColor(isSelected ? .white : .primary)
+                .cornerRadius(12)
+                .shadow(color: isSelected ? .blue.opacity(0.25) : .black.opacity(0.05), radius: 4, y: 2)
+                .scaleEffect(isSelected ? 1.03 : 1.0)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct MiniStatCard: View {
+    let title: String
+    let value: String
+    let icon: String
+    let tint: Color
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Image(systemName: icon)
+                .foregroundColor(tint)
+                .font(.headline)
+            
+            Text(title)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            
+            Text(value.isEmpty ? "--" : value)
+                .font(.subheadline)
+                .fontWeight(.bold)
+                .foregroundColor(.primary)
+        }
+        .padding()
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(14)
+    }
+}
+
+struct FavoriteStrip: View {
+    @ObservedObject var viewModel: MapViewModel
+    
+    var body: some View {
+        if !viewModel.favoriteSchools.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(viewModel.favoriteSchools, id: \.id) { school in
+                        Button {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                                viewModel.selectedSchool = school
+                                viewModel.position = .region(
+                                    MKCoordinateRegion(
+                                        center: school.coordinate,
+                                        span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
+                                    )
+                                )
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "heart.fill")
+                                    .foregroundColor(.pink)
+                                Text(school.name(isChinese: viewModel.isChinese))
+                                    .font(.caption)
+                                    .fontWeight(.semibold)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 10)
+                            .background(Color(.systemBackground).opacity(0.95))
+                            .cornerRadius(12)
+                            .shadow(color: .black.opacity(0.08), radius: 4, y: 2)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal)
+            }
+            .padding(.top, 6)
+            .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
 }
@@ -393,13 +758,13 @@ struct FilterChip: View {
 struct SettingsView: View {
     @ObservedObject var viewModel: MapViewModel
     @Environment(\.dismiss) var dismiss
+    
     var body: some View {
         NavigationStack {
             Form {
                 Section(viewModel.isChinese ? "語言設定" : "Language Settings") {
                     Toggle(viewModel.isChinese ? "繁體中文" : "Traditional Chinese", isOn: $viewModel.isChinese)
-                        .onChange(of: viewModel.isChinese) {
-                            // FAST, ZERO-NETWORK REFRESH: Instantly redraws the map markers in the new language!
+                        .onChange(of: viewModel.isChinese) { _ in
                             viewModel.forceMapRefresh()
                             if viewModel.selectedSchool != nil {
                                 viewModel.fetchNearbyTransit()
@@ -407,159 +772,615 @@ struct SettingsView: View {
                             }
                         }
                 }
+                
+                Section(viewModel.isChinese ? "地圖樣式" : "Map Style") {
+                    Picker("Map", selection: $viewModel.mapDisplayMode) {
+                        ForEach(MapDisplayMode.allCases, id: \.self) { mode in
+                            Label(mode.label(isChinese: viewModel.isChinese), systemImage: mode.icon)
+                                .tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                
                 Section(viewModel.isChinese ? "起點地址" : "Home Location") {
                     TextField(viewModel.isChinese ? "輸入香港地址" : "Enter HK address", text: $viewModel.savedHomeAddress)
-                    Button(viewModel.isChinese ? "儲存" : "Save") { viewModel.geocodeHomeAddress(); dismiss() }
-                        .disabled(viewModel.savedHomeAddress.isEmpty)
+                    Button(viewModel.isChinese ? "儲存" : "Save") {
+                        viewModel.geocodeHomeAddress()
+                        dismiss()
+                    }
+                    .disabled(viewModel.savedHomeAddress.isEmpty)
                 }
             }
             .navigationTitle(viewModel.isChinese ? "設定" : "Settings")
-            .toolbar { Button(viewModel.isChinese ? "完成" : "Done") { dismiss() } }
+            .toolbar {
+                Button(viewModel.isChinese ? "完成" : "Done") {
+                    dismiss()
+                }
+            }
         }
     }
 }
 
+// MARK: - 6. Main ContentView
 struct ContentView: View {
     @StateObject private var viewModel = MapViewModel()
+    @State private var animateSelectionCard = false
+    
+    @FocusState private var isSearchFocused: Bool
     
     var body: some View {
         ZStack(alignment: .top) {
-            Map(position: $viewModel.position, selection: $viewModel.selectedSchool) {
-                if let start = viewModel.startPoint {
-                    Annotation(viewModel.isChinese ? "起點" : "Home", coordinate: start) {
-                        Image(systemName: "house.fill").padding(8).background(.blue).foregroundColor(.white).clipShape(Circle())
-                    }
+            mapView
+            topOverlay
+            bottomCardOverlay
+        }
+        .sheet(isPresented: $viewModel.showSettings) {
+            SettingsView(viewModel: viewModel)
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.82), value: viewModel.selectedSchool?.id)
+        .animation(.easeInOut(duration: 0.25), value: viewModel.favoriteSchools.count)
+        .animation(.easeInOut(duration: 0.2), value: viewModel.searchText)
+    }
+    
+    // MARK: Map View
+    private var mapView: some View {
+        Map(position: $viewModel.position, selection: $viewModel.selectedSchool) {
+            if let start = viewModel.startPoint {
+                Annotation(viewModel.isChinese ? "起點" : "Home", coordinate: start) {
+                    Image(systemName: "house.fill")
+                        .padding(10)
+                        .background(.blue)
+                        .foregroundColor(.white)
+                        .clipShape(Circle())
+                        .shadow(radius: 4)
                 }
-                if let route = viewModel.route { MapPolyline(route.polyline).stroke(.blue, lineWidth: 5) }
+            }
+            
+            if let route = viewModel.route {
+                MapPolyline(route.polyline)
+                    .stroke(.blue, lineWidth: 5)
+            }
+            
+            ForEach(viewModel.filteredSchools, id: \.id) { school in
+                Marker(
+                    school.name(isChinese: viewModel.isChinese),
+                    systemImage: school.mapIcon,
+                    coordinate: school.coordinate
+                )
+                .tint(colorForLevel(school.levelEN))
+                .tag(school)
+            }
+        }
+        .mapStyle(currentMapStyle)
+        .edgesIgnoringSafeArea(.all)
+    }
+    
+    private var currentMapStyle: MapStyle {
+        switch viewModel.mapDisplayMode {
+        case .standard:
+            return .standard(elevation: .realistic)
+        case .hybrid:
+            return .hybrid(elevation: .realistic)
+        case .imagery:
+            return .imagery(elevation: .realistic)
+        }
+    }
+    
+    // MARK: Top Overlay
+    private var topOverlay: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 12) {
+                headerBar
+                searchBar
+                searchResultsList
+                levelFilterRow
+                districtFilterRow
+                FavoriteStrip(viewModel: viewModel)
+            }
+            .padding(.top, 8)
+            .padding(.bottom, 14)
+            .background(
+                LinearGradient(
+                    colors: [
+                        Color.black.opacity(0.28),
+                        Color.black.opacity(0.08),
+                        Color.clear
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+            
+            Spacer()
+        }
+    }
+    
+    private var headerBar: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(viewModel.isChinese ? "學校探索地圖" : "School Explorer")
+                    .font(.title3)
+                    .fontWeight(.bold)
+                    .foregroundColor(.white)
                 
-                ForEach(viewModel.filteredSchools, id: \.id) { school in
-                    Marker(school.name(isChinese: viewModel.isChinese), systemImage: school.mapIcon, coordinate: school.coordinate)
-                        .tint(colorForLevel(school.levelEN)).tag(school)
+                Text(viewModel.isChinese ? "搜尋、比較、導航" : "Search, match and navigate")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.9))
+            }
+            
+            Spacer()
+            
+            Button {
+                viewModel.showSettings = true
+            } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.title3)
+                    .foregroundColor(.white)
+                    .padding(12)
+                    .background(.ultraThinMaterial.opacity(0.95))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal)
+    }
+    
+    private var searchBar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundColor(.secondary)
+                
+                TextField(viewModel.isChinese ? "搜尋學校..." : "Search schools...", text: $viewModel.searchText)
+                    .textInputAutocapitalization(.never)
+                    .focused($isSearchFocused)
+                
+                if !viewModel.searchText.isEmpty {
+                    Button {
+                        viewModel.searchText = ""
+                        isSearchFocused = false
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(.secondary.opacity(0.8))
+                    }
+                    .transition(.scale)
                 }
             }
-            .edgesIgnoringSafeArea(.all)
+            .padding(12)
+            .background(Color(.systemBackground).opacity(0.96))
+            .cornerRadius(14)
+            .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
             
-            VStack(spacing: 0) {
-                VStack(spacing: 10) {
-                    HStack {
-                        HStack {
-                            Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-                            TextField(viewModel.isChinese ? "搜尋學校..." : "Search schools...", text: $viewModel.searchText)
+            Menu {
+                ForEach(MapDisplayMode.allCases, id: \.self) { mode in
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            viewModel.mapDisplayMode = mode
                         }
-                        .padding(10).background(.background).cornerRadius(10)
-                        
-                        Button { viewModel.showSettings = true } label: {
-                            Image(systemName: "gearshape.fill").font(.title2).foregroundColor(.blue).padding(8).background(.background).cornerRadius(10)
-                        }
-                    }.padding(.horizontal)
-                    
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack {
-                            ForEach(viewModel.availableLevels, id: \.self) { level in
-                                FilterChip(title: viewModel.translateLevel(level), isSelected: viewModel.selectedLevel == level) { viewModel.selectedLevel = level }
-                            }
-                        }.padding(.horizontal)
+                    } label: {
+                        Label(mode.label(isChinese: viewModel.isChinese), systemImage: mode.icon)
                     }
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack {
-                            ForEach(viewModel.availableDistricts, id: \.self) { dist in
-                                FilterChip(title: viewModel.translateDistrict(dist), isSelected: viewModel.selectedDistrict == dist) { viewModel.selectedDistrict = dist }
-                            }
-                        }.padding(.horizontal)
-                    }
-                }.padding(.vertical, 10).background(.ultraThinMaterial)
-                Spacer()
+                }
+            } label: {
+                Image(systemName: viewModel.mapDisplayMode.icon)
+                    .font(.title3)
+                    .foregroundColor(.blue)
+                    .padding(12)
+                    .background(Color(.systemBackground).opacity(0.96))
+                    .cornerRadius(14)
+                    .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
             }
+        }
+        .padding(.horizontal)
+    }
+    
+    @ViewBuilder
+    private var searchResultsList: some View {
+        if isSearchFocused && !viewModel.searchText.isEmpty {
+            let suggestions = Array(viewModel.filteredSchools.prefix(6))
             
+            if !suggestions.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(suggestions) { school in
+                        Button {
+                            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                            isSearchFocused = false
+                            
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                                viewModel.selectedSchool = school
+                                viewModel.position = .region(
+                                    MKCoordinateRegion(
+                                        center: school.coordinate,
+                                        span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+                                    )
+                                )
+                            }
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "mappin.circle.fill")
+                                    .foregroundColor(colorForLevel(school.levelEN))
+                                    .font(.title3)
+                                
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(school.name(isChinese: viewModel.isChinese))
+                                        .font(.subheadline)
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.primary)
+                                        .lineLimit(1)
+                                    
+                                    Text(school.address(isChinese: viewModel.isChinese))
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                            }
+                            .padding(.vertical, 10)
+                            .padding(.horizontal, 14)
+                            .background(Color(.systemBackground).opacity(0.98))
+                        }
+                        .buttonStyle(.plain)
+                        
+                        if school.id != suggestions.last?.id {
+                            Divider()
+                                .padding(.leading, 40)
+                        }
+                    }
+                }
+                .background(Color(.systemBackground).opacity(0.98))
+                .cornerRadius(14)
+                .shadow(color: .black.opacity(0.12), radius: 10, y: 5)
+                .padding(.horizontal)
+                .padding(.top, -4)
+            }
+        }
+    }
+    
+    private var levelFilterRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack {
+                ForEach(viewModel.availableLevels, id: \.self) { level in
+                    FilterChip(
+                        title: viewModel.translateLevel(level),
+                        isSelected: viewModel.selectedLevel == level
+                    ) {
+                        viewModel.selectedLevel = level
+                    }
+                }
+            }
+            .padding(.horizontal)
+        }
+    }
+    
+    private var districtFilterRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack {
+                ForEach(viewModel.availableDistricts, id: \.self) { dist in
+                    FilterChip(
+                        title: viewModel.translateDistrict(dist),
+                        isSelected: viewModel.selectedDistrict == dist
+                    ) {
+                        viewModel.selectedDistrict = dist
+                    }
+                }
+            }
+            .padding(.horizontal)
+        }
+    }
+    
+    // MARK: Bottom Card Overlay
+    private var bottomCardOverlay: some View {
+        Group {
             if let school = viewModel.selectedSchool {
                 VStack {
                     Spacer()
-                    VStack(alignment: .leading, spacing: 12) {
-                        HStack(alignment: .top) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(school.name(isChinese: viewModel.isChinese))
-                                    .font(.headline)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                
-                                HStack(spacing: 6) {
-                                    Text(viewModel.translateLevel(school.levelEN))
-                                        .font(.caption)
-                                        .bold()
-                                        .foregroundColor(colorForLevel(school.levelEN))
-                                    
-                                    if !school.financeTypeEN.isEmpty {
-                                        Text("•").font(.caption).foregroundColor(.secondary)
-                                        Text(viewModel.translateFinanceType(school.financeTypeEN))
-                                            .font(.caption)
-                                            .bold()
-                                            .foregroundColor(.secondary)
-                                    }
-                                }
-                            }
-                            Spacer()
-                            Button { viewModel.selectedSchool = nil; viewModel.route = nil } label: {
-                                Image(systemName: "xmark.circle.fill").foregroundColor(.secondary).font(.title2)
-                            }
-                        }
-                        
-                        Divider()
-                        
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label(school.address(isChinese: viewModel.isChinese), systemImage: "mappin.and.ellipse")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                            
-                            Label(viewModel.isChinese ? "最近地鐵站: \(viewModel.nearbyMTR)" : "Nearest MTR: \(viewModel.nearbyMTR)", systemImage: "tram.fill")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color.secondary.opacity(0.1))
-                        .cornerRadius(8)
-                        
-                        Picker("Mode", selection: $viewModel.transportMode) {
-                            ForEach(TransportMode.allCases, id: \.self) { mode in
-                                Label(mode.label(isChinese: viewModel.isChinese), systemImage: mode.rawValue).tag(mode)
-                            }
-                        }.pickerStyle(.segmented)
-                        
-                        HStack {
-                            if viewModel.isCalculating {
-                                ProgressView()
-                                Text(viewModel.isChinese ? " 計算中..." : " Calculating...")
-                                    .font(.caption).foregroundColor(.secondary)
-                            }
-                            else {
-                                Label(viewModel.travelTime, systemImage: "clock.fill")
-                                Label(viewModel.travelDistance, systemImage: "arrow.triangle.turn.up.right.diamond.fill")
-                            }
-                        }.font(.subheadline).bold().foregroundColor(.blue)
-                        
-                        Button {
-                            let loc = CLLocation(latitude: school.coordinate.latitude, longitude: school.coordinate.longitude)
-                            let mapItem = MKMapItem(location: loc, address: nil)
-                            mapItem.name = school.name(isChinese: viewModel.isChinese)
-                            let modeKey = viewModel.transportMode == .drive ? MKLaunchOptionsDirectionsModeDriving : (viewModel.transportMode == .walk ? MKLaunchOptionsDirectionsModeWalking : MKLaunchOptionsDirectionsModeTransit)
-                            mapItem.openInMaps(launchOptions: [MKLaunchOptionsDirectionsModeKey: modeKey])
-                        } label: {
-                            Text(viewModel.isChinese ? "開始導航" : "Start Navigation").frame(maxWidth: .infinity).padding().background(.blue).foregroundColor(.white).cornerRadius(12)
+                    
+                    VStack(alignment: .leading, spacing: 14) {
+                        schoolHeader(school)
+                        highlightInfoBox(school)
+                        scoreAndActionsRow(school)
+                        transportPicker
+                        statsRow
+                        actionButtons(school)
+                    }
+                    .padding()
+                    .background(
+                        RoundedRectangle(cornerRadius: 24, style: .continuous)
+                            .fill(Color(.systemBackground))
+                            .shadow(color: .black.opacity(0.18), radius: 18, y: 6)
+                    )
+                    .padding()
+                    .scaleEffect(animateSelectionCard ? 1.0 : 0.96)
+                    .opacity(animateSelectionCard ? 1.0 : 0.0)
+                    .onAppear {
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) {
+                            animateSelectionCard = true
                         }
                     }
-                    .padding().background(Color(.systemBackground)).cornerRadius(20).shadow(radius: 10).padding()
+                    .onDisappear {
+                        animateSelectionCard = false
+                    }
                 }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .sheet(isPresented: $viewModel.showSettings) { SettingsView(viewModel: viewModel) }
     }
     
+    private func schoolHeader(_ school: School) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(colorForLevel(school.levelEN).opacity(0.15))
+                    .frame(width: 48, height: 48)
+                
+                Image(systemName: school.mapIcon)
+                    .foregroundColor(colorForLevel(school.levelEN))
+                    .font(.title3)
+            }
+            
+            VStack(alignment: .leading, spacing: 6) {
+                Text(school.name(isChinese: viewModel.isChinese))
+                    .font(.headline)
+                    .fixedSize(horizontal: false, vertical: true)
+                
+                HStack(spacing: 6) {
+                    Text(viewModel.translateLevel(school.levelEN))
+                        .font(.caption)
+                        .bold()
+                        .foregroundColor(colorForLevel(school.levelEN))
+                    
+                    if !school.financeTypeEN.isEmpty {
+                        Text("•")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        
+                        Text(viewModel.translateFinanceType(school.financeTypeEN))
+                            .font(.caption)
+                            .bold()
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            
+            Spacer()
+            
+            Button {
+                withAnimation(.spring()) {
+                    viewModel.selectedSchool = nil
+                    viewModel.route = nil
+                }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundColor(.secondary)
+                    .font(.title2)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+    
+    private func highlightInfoBox(_ school: School) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(school.address(isChinese: viewModel.isChinese), systemImage: "mappin.and.ellipse")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            
+            Label(
+                viewModel.isChinese
+                    ? "最近地鐵站: \(viewModel.nearbyMTR)"
+                    : "Nearest MTR: \(viewModel.nearbyMTR)",
+                systemImage: "tram.fill"
+            )
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: [Color.blue.opacity(0.08), Color.cyan.opacity(0.08)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .cornerRadius(14)
+    }
+    
+    private func scoreAndActionsRow(_ school: School) -> some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .stroke(Color.blue.opacity(0.18), lineWidth: 8)
+                        .frame(width: 56, height: 56)
+                    
+                    Circle()
+                        .trim(from: 0, to: CGFloat(viewModel.smartMatchScore(for: school)) / 100.0)
+                        .stroke(
+                            LinearGradient(colors: [.blue, .cyan], startPoint: .topLeading, endPoint: .bottomTrailing),
+                            style: StrokeStyle(lineWidth: 8, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: 56, height: 56)
+                    
+                    Text("\(viewModel.smartMatchScore(for: school))")
+                        .font(.subheadline)
+                        .fontWeight(.bold)
+                }
+                
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(viewModel.isChinese ? "智能匹配分" : "Smart Match")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text(viewModel.isChinese ? "依搜尋條件及路線評估" : "Based on filters and route")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+            
+            Spacer()
+            
+            Button {
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.6)) {
+                    viewModel.toggleFavorite(school)
+                }
+            } label: {
+                Image(systemName: viewModel.isFavorite(school) ? "heart.fill" : "heart")
+                    .font(.title3)
+                    .foregroundColor(viewModel.isFavorite(school) ? .pink : .secondary)
+                    .padding(12)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(Circle())
+                    .scaleEffect(viewModel.isFavorite(school) ? 1.12 : 1.0)
+            }
+            .buttonStyle(.plain)
+            
+            Button {
+                viewModel.speakSchoolInfo(school)
+            } label: {
+                Image(systemName: "speaker.wave.2.fill")
+                    .font(.title3)
+                    .foregroundColor(.blue)
+                    .padding(12)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+        }
+    }
+    
+    private var transportPicker: some View {
+        Picker("Mode", selection: $viewModel.transportMode) {
+            ForEach(TransportMode.allCases, id: \.self) { mode in
+                Label(mode.label(isChinese: viewModel.isChinese), systemImage: mode.rawValue)
+                    .tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
+    
+    private var statsRow: some View {
+        HStack(spacing: 10) {
+            if viewModel.isCalculating {
+                MiniStatCard(
+                    title: viewModel.isChinese ? "路線" : "Route",
+                    value: viewModel.isChinese ? "計算中..." : "Calculating...",
+                    icon: "clock.arrow.circlepath",
+                    tint: .blue
+                )
+                
+                MiniStatCard(
+                    title: viewModel.isChinese ? "距離" : "Distance",
+                    value: "--",
+                    icon: "point.topleft.down.curvedto.point.bottomright.up",
+                    tint: .cyan
+                )
+            } else {
+                MiniStatCard(
+                    title: viewModel.isChinese ? "時間" : "Time",
+                    value: viewModel.travelTime,
+                    icon: "clock.fill",
+                    tint: .blue
+                )
+                
+                MiniStatCard(
+                    title: viewModel.isChinese ? "距離" : "Distance",
+                    value: viewModel.travelDistance,
+                    icon: "arrow.triangle.turn.up.right.diamond.fill",
+                    tint: .cyan
+                )
+            }
+        }
+    }
+    
+    private func actionButtons(_ school: School) -> some View {
+        VStack(spacing: 10) {
+            Button {
+                print("当前用户位置：\(String(describing: viewModel.currentUserLocation))")
+                print("当前Home地址坐标：\(String(describing: viewModel.startPoint))")
+
+                let sourceCoordinate: CLLocationCoordinate2D
+
+                if let userCoord = viewModel.currentUserLocation {
+                    sourceCoordinate = userCoord
+                } else if let homeCoord = viewModel.startPoint {
+                    sourceCoordinate = homeCoord
+                } else {
+                    print("❌ 没有真实定位，也没有Home地址坐标，无法导航")
+                    return
+                }
+
+                let startLoc = CLLocation(latitude: sourceCoordinate.latitude, longitude: sourceCoordinate.longitude)
+                let sourceItem = MKMapItem(location: startLoc, address: nil)
+                sourceItem.name = viewModel.isChinese ? "我的位置" : "My Location"
+                
+                let endLoc = CLLocation(latitude: school.coordinate.latitude, longitude: school.coordinate.longitude)
+                let destinationItem = MKMapItem(location: endLoc, address: nil)
+                destinationItem.name = school.name(isChinese: viewModel.isChinese)
+                
+                let modeKey = viewModel.transportMode == .drive
+                    ? MKLaunchOptionsDirectionsModeDriving
+                    : (viewModel.transportMode == .walk
+                        ? MKLaunchOptionsDirectionsModeWalking
+                        : MKLaunchOptionsDirectionsModeTransit)
+                
+                MKMapItem.openMaps(
+                    with: [sourceItem, destinationItem],
+                    launchOptions: [MKLaunchOptionsDirectionsModeKey: modeKey]
+                )
+            } label: {
+                HStack {
+                    Image(systemName: "location.fill")
+                    Text(viewModel.isChinese ? "開始導航" : "Start Navigation")
+                        .fontWeight(.bold)
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(
+                    LinearGradient(
+                        colors: [.blue, .cyan],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .foregroundColor(.white)
+                .cornerRadius(14)
+            }
+            .buttonStyle(.plain)
+            
+            Button {
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    viewModel.position = .region(
+                        MKCoordinateRegion(
+                            center: school.coordinate,
+                            span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+                        )
+                    )
+                }
+            } label: {
+                HStack {
+                    Image(systemName: "scope")
+                    Text(viewModel.isChinese ? "聚焦學校位置" : "Focus on School")
+                        .fontWeight(.semibold)
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color(.secondarySystemBackground))
+                .foregroundColor(.primary)
+                .cornerRadius(14)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+    
+    // MARK: Helpers
     func colorForLevel(_ level: String) -> Color {
         let l = level.lowercased()
         if l.contains("kindergarten") { return .purple }
         if l.contains("primary") { return .green }
-        if l.contains("secondary") { return .blue }
         if l.contains("post-secondary") { return .orange }
+        if l.contains("secondary") { return .blue }
         return .red
     }
 }
