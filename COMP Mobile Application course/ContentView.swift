@@ -899,7 +899,7 @@ struct ContentView: View {
     private var headerBar: some View {
         HStack {
             VStack(alignment: .leading, spacing: 4) {
-                Text(viewModel.isChinese ? "學校探索地圖" : "School Explorer")
+                Text(viewModel.isChinese ? "EduMap 導航者" : "EduMap Navigator")
                     .font(.title3)
                     .fontWeight(.bold)
                     .foregroundColor(.white)
